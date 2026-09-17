@@ -71,4 +71,29 @@ class MokioMindConfig(PretrainedConfig):
             else None
         )
 
+import torch
+import torch.nn as nn
+class RMSNorm(nn.Module):
+    def __init__(self, hidden_dim:int, eps:float=1e-6):
+        super().__init__()
+        # # x.shape = (B, L, D)
+        # B: batch_size，一批中有多少条 sequence
+        # L: seq_len，每条 sequence 中有多少个 token
+        # D: hidden_dim，每个 token 的 hidden state 有多少维
+        # hidden_dim表示token维度
+        self.dim = hidden_dim
+        # 防止除以0
+        self.eps = eps
+        # # 每个 hidden dimension 都有一个独立的可学习缩放参数
+        self.weight = nn.Parameter(torch.ones(self.dim))
 
+    def forward(self, x):
+        # 平方均值（Mean Square）
+        mean_squared = x.pow(2).mean(
+            dim = -1, # 在BLD的最后一个D维度上进行计算
+            keepdim = True # 计算完之后保留最后一个维度BLD->BL1
+        )
+        rsqrt = torch.rsqrt(mean_squared + self.eps)
+        x_norm = x * rsqrt
+        output = self.weight * x_norm
+        return output
