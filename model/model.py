@@ -1,7 +1,7 @@
 from transformers import PretrainedConfig
 
 
-class WjjMindConfig(PretrainedConfig):
+class MymindConfig(PretrainedConfig):
     model_type = "mokiomind"
 
     def __init__(
@@ -41,9 +41,12 @@ class WjjMindConfig(PretrainedConfig):
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.max_position_embeddings = max_position_embeddings
+
+        # Q以及KV的头数 
         self.num_attention_heads = num_attention_heads
-        self.num_hidden_layers = num_hidden_layers
         self.num_key_value_heads = num_key_value_heads
+
+        self.num_hidden_layers = num_hidden_layers
         self.vocab_size = vocab_size
         self.rms_norm_eps = rms_norm_eps
         self.rope_theta = rope_theta
@@ -57,14 +60,14 @@ class WjjMindConfig(PretrainedConfig):
         self.norm_topk_prob = norm_topk_prob
         self.aux_loss_alpha = aux_loss_alpha
         self.scoring_func = scoring_func
-
+        # yarn的参数
         self.rope_scaling = (
             {
-                "beta_fast": 32,
-                "beta_slow": 1,
-                "factor": 16,
-                "original_max_position_embeddings": 2048,
-                "attention_factor": 1.0,
+                "beta_fast": 32, # hiddendim中的i如果在训练的时候转的圈数大于beta_fast则不用线性缩放
+                "beta_slow": 1, # hiddendim中的i如果在训练的时候转的圈数小于beta_slow则完全线性缩放theta_i / s(factor)
+                "factor": 16, # s = L' / L
+                "original_max_position_embeddings": 2048, # 原始训练时的最长token数量
+                "attention_factor": 1.0, # attention计算的时候的参数t
                 "type": "yarn",
             }
             if self.inference_rope_scaling
@@ -100,8 +103,8 @@ class RMSNorm(nn.Module):
 
 # 先写yarn方法
 import math
-from typing import Optional
-
+from typing import Optional, Tuple
+from torch.nn import functional as F
 def precompute_freqs(
     dim: int,
     end: int = int(32 * 1024),
@@ -178,7 +181,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     # (x,y) -> (-y,x)
     def rotate_half(x):
         return torch.cat((-x[..., x.shape(-1)//2:], x[...,:x.shape[-1]//2]),dim=-1)
-    # (BLD) -> (BHLD)
+    # (BHD) -> (BLHD)
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
     # (xcos,ycos) + (-ysin,xsin) = (xcos-ysin,xsin+ycos)
@@ -186,3 +189,109 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     k_embed = k*cos + rotate_half(k)*sin
     return q_embed, k_embed
 
+def repeat_kv(x:torch.Tensor, n_rep:int)->torch.Tensor:
+    B, L, H, d = x.shape
+    if n_rep == 1:
+        return x
+    return(
+        x[:,:,:,None,:].expand(B,L,H,n_rep,d).reshape(B,L,H*n_rep,d)
+    )
+
+class Attention(nn.Module):
+    def __init__(self, args:MymindConfig):
+        super().__init__()
+        # 有GQA用GQA 没有 就用MHA
+        self.num_key_value_heads = (
+            args.num_attention_heads
+            if args.num_key_value_heads is None
+            else args.num_key
+        )
+        assert args.num_attention_heads % self.num_key_value_heads == 0
+
+        self.n_local_heads = args.num_attention_heads
+        self.n_local_kv_heads = self.num_key_value_heads
+        self.n_rep = self.n_local_heads // self.n_local_kv_heads
+        self.head_dim = args.hidden_size // self.n_local_heads
+
+        self.q_proj = nn.Linear(args.hidden_size, args.hidden_size, bias=False)
+        self.k_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        # 出投影层。把多头 Attention 拼接后的结果再做一次线性变换
+        self.o_proj = nn.Linear(args.hidden_size, args.hidden_size, bias=False)
+        # 对 Attention 权重 softmax(QKᵀ) 做 dropout
+        self.attn_dropout = nn.Dropout(args.dropout)
+        # 对 Attention 最终输出 做 dropout，再送到残差连接
+        self.resid_dropout = nn.Dropout(args.dropout)
+        # 只是保存 dropout 概率，例如 0.1，主要给 Flash Attention 使用
+        self.dropout = args.dropout
+        # 判断是否可以使用 PyTorch 的 Flash/SDPA Attention 加速实现。
+        # 要求 PyTorch 有 scaled_dot_product_attention，并且配置里 flash_attention=True
+        self.flash = (
+            hasattr(torch.nn.functional, "scaled_dot_product_attention")
+            and args.flash_attention
+        )
+
+    def forward(
+        self, x:torch.Tensor,position_embeddings:Tuple[torch.Tensor,torch.Tensor],
+        past_key_value:Optional[Tuple[torch.Tensor,torch.Tensor]] = None,
+        use_cache=False,
+        attention_mask:Optional[torch.Tensor] = None
+    ):
+        # x.shape = (B,L,D)
+        bsz, seq_len, _ = x.shape
+        xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
+        xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
+        cos, sin = position_embeddings 
+        xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin)
+        # kv_cache实现
+        if past_key_value is not None:
+            # 在句子长度S上进行拼接！
+            xk = torch.cat([past_key_value[0], xk], dim=1)
+            xv = torch.cat([past_key_value[1], xv], dim=1)
+        past_kv = (xk, xv) if use_cache else None
+
+        # 注意力分数计算QK^T需要保持维度一致,同时将QKV转换维度为(BHLD)
+        xq, xk, xv = (
+            xq.transpose(1, 2),
+            repeat_kv(xk, self.n_rep).transpose(1, 2),
+            repeat_kv(xv, self.n_rep).transpose(1, 2),
+        )
+
+        if (
+            self.flash
+            and (seq_len > 1) # 不只是单 token 推理
+            and (past_key_value is None) # 没使用 KV Cache
+            and (attention_mask is None or torch.all(attention_mask == 1)) # 没有 padding 之类的特殊 mask
+        ):
+            output = F.scaled_dot_product_attention(
+                xq,
+                xk,
+                xv,
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=True,
+            )
+        else:
+            # scores.shape = (BHLL)
+            scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            # -seq_len: = 只对当前新增 token 对应的最后几列 K 做 causal mask
+            scores[:, :, :, -seq_len:] += torch.triu(
+                torch.full((seq_len, seq_len), float("-inf"), device=scores.device),# 将(L,L)矩阵填充"-inf"
+                diagonal=1,# 对角线以上不包括对角线保留原来的值,其余为0
+            )
+            # 把 padding 位置屏蔽掉，让模型不要关注无效 token
+            if attention_mask is not None:
+                # BS -> BHLS
+                extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+                extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
+                scores = scores + extended_attention_mask
+            # 沿最后一个维度，也就是“对每个 Q 的所有 K 分数做 softmax”
+            # 用 float32 安全地算 softmax，再恢复成 Q 原来的数据类型
+            scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+            scores = self.attn_dropout(scores)
+            output = scores @ xv
+
+        output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
+        output = self.resid_dropout(self.o_proj(output))
+        return output, past_kv
