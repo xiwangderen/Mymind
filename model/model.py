@@ -1,4 +1,5 @@
-from transformers import PretrainedConfig
+from transformers import GenerationMixin, PreTrainedModel, PretrainedConfig
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 class MymindConfig(PretrainedConfig):
     model_type = "mokiomind"
@@ -32,25 +33,37 @@ class MymindConfig(PretrainedConfig):
         **kwargs,
     ):
         super().__init__(**kwargs)
-
+        # dropout值
         self.dropout = dropout
+
         self.bos_token_id = bos_token_id
+
         self.eos_token_id = eos_token_id
+
         self.hidden_act = hidden_act
+        # 维度D
         self.hidden_size = hidden_size
+        # 进行FFN时的升维后的中间维度
         self.intermediate_size = intermediate_size
+        # 最大的上下文长度
         self.max_position_embeddings = max_position_embeddings
-
-        # Q以及KV的头数 
+        # Q的头数 
         self.num_attention_heads = num_attention_heads
+        # KV的头数
         self.num_key_value_heads = num_key_value_heads
-
+        # Transformer的(GQA+FFN)层数
         self.num_hidden_layers = num_hidden_layers
+        # 词典的大小
         self.vocab_size = vocab_size
+        # rms的分母中防止除数为0的eps
         self.rms_norm_eps = rms_norm_eps
+        # 公式中theta = b^(-2i / d)中的b
         self.rope_theta = rope_theta
+        # 是否使用yarn进行推理
         self.inference_rope_scaling = inference_rope_scaling
+        # 是否使用flash attention
         self.flash_attention = flash_attention
+
         self.use_moe = use_moe
         self.num_experts_per_tok = num_experts_per_tok
         self.n_routed_experts = n_routed_experts
@@ -102,7 +115,7 @@ class RMSNorm(nn.Module):
 
 # 先写yarn方法
 import math
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple, Union
 from torch.nn import functional as F
 def precompute_freqs(
     dim: int,
@@ -203,7 +216,7 @@ class Attention(nn.Module):
         self.num_key_value_heads = (
             args.num_attention_heads
             if args.num_key_value_heads is None
-            else args.num_key
+            else args.num_key_value_heads
         )
         assert args.num_attention_heads % self.num_key_value_heads == 0
 
@@ -281,7 +294,7 @@ class Attention(nn.Module):
             )
             # 把 padding 位置屏蔽掉，让模型不要关注无效 token
             if attention_mask is not None:
-                # BS -> BHLS
+                # Bd -> BHLd
                 extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
                 extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
                 scores = scores + extended_attention_mask
@@ -311,4 +324,191 @@ class FeedForward(nn.Module):
 
     def forward(self, x):
         return self.dropout(self.down_proj(self.up_proj(x) * self.act_fn(self.gate_proj(x))))
+
+class MymindBlock(nn.Module):
+    def __init__(self, layer_id: int, config: MymindConfig):
+        super().__init__()
+        self.num_attention_heads = config.num_attention_heads
+        self.hidden_size = config.hidden_size
+        self.head_dim = config.hidden_size // config.num_attention_heads
+        self.self_attention = Attention(config)
+
+        self.layer_id = layer_id
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.mlp = (
+            FeedForward(config)
+            # if not config.use_moe
+            # else MoEFeedForward(config)  # ！修正：原MoEFeedForaward拼写错误
+        )
+
+    def forward(
+        self,
+        hidden_states,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache=False,
+        attention_mask: Optional[torch.Tensor] = None,
+    ):
+        res = hidden_states
+
+        hidden_states, present_key_value = self.self_attention(
+            self.input_layernorm(hidden_states),  # pre-norm
+            position_embeddings,
+            past_key_value,
+            use_cache,
+            attention_mask,
+        )
+
+        hidden_states = res + hidden_states
+
+        hidden_states = hidden_states + self.mlp(
+            self.post_attention_layernorm(hidden_states)
+        )
+        return hidden_states, present_key_value
+
+class MymindModel(nn.Module):
+    def __init__(self, config: MymindConfig):
+        super().__init__()
+        self.config = config
+        self.vocab_size, self.num_hidden_layers = (
+            config.vocab_size,
+            config.num_hidden_layers,
+        )
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.dropout = nn.Dropout(config.dropout)
+        self.layers = nn.ModuleList(
+            [MymindBlock(l, config) for l in range(self.num_hidden_layers)]
+        )
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        freqs_cos, freqs_sin = precompute_freqs(
+            dim=config.hidden_size // config.num_attention_heads,
+            end=config.max_position_embeddings,
+            rope_base=config.rope_theta,
+            rope_scaling=config.rope_scaling,
+        )
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
+
+    def forward(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        use_cache: bool = False,
+        **kwargs,
+    ):
+        # input_ids: [B,L]
+        batch_size, seq_length = input_ids.shape
+        # 如果传进来的 past_key_values 不是你这份代码期望的“List[Tuple[K,V]]”格式，
+        # 而是某种带 .layers 属性的 Cache 对象，就先把它丢掉，重新按自己的格式处理
+        if hasattr(past_key_values, "layers"):
+            past_key_values = None
+
+        past_key_values = past_key_values or [None] * len(self.layers)
+
+        # 计算start_pos：如果存在past，则start_pos为已有past序列长度
+        start_pos = (
+            # KV 的 shape B L_KV H D
+            past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
+        )
+
+        # Embedding + dropout
+        hidden_states = self.dropout(
+            self.embed_tokens(input_ids)
+        )  # [B, L, D]
+
+        position_embeddings = (
+            self.freqs_cos[start_pos : start_pos + seq_length],
+            self.freqs_sin[start_pos : start_pos + seq_length],
+        )
+
+        presents = []
+        # 让 hidden_states 依次通过每一层 Transformer Block，
+        # 同时给每一层传入它自己的 KV Cache，并收集新的 KV Cache
+        for (layer, past_key_value) in zip(self.layers, past_key_values):
+            hidden_states, present = layer(
+                hidden_states,
+                position_embeddings,
+                past_key_value=past_key_value,
+                use_cache=use_cache,
+                attention_mask=attention_mask,
+            )
+            presents.append(present)
+        # B L D
+        hidden_states = self.norm(hidden_states)
+
+        # aux_loss = sum(
+        #     [
+        #         layer.mlp.aux_loss
+        #         for layer in self.layers
+        #         if isinstance(
+        #             layer.mlp, MoEFeedForward
+        #         )  # ！修正：原MoEFeedForaward拼写错误
+        #     ],
+        #     hidden_states.new_zeros(1).squeeze(),
+        # )
+
+        return hidden_states, presents
+    # , aux_loss
+
+class MymindForCausalLM(PreTrainedModel, GenerationMixin):
+    config_class = MymindConfig
+
+    def __init__(self, config: MymindConfig):
+        super().__init__(config)
+        self.model = MymindModel(config)
+        # 映射到词表的维度得到每个token的预测分数
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        # Weight Tying（权重共享）
+        # 输入 Embedding 的权重 = 输出 lm_head 的权重
+        self.model.embed_tokens.weight = self.lm_head.weight
+
+    def forward(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        use_cache: bool = False,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        **args,
+    ):
+        hidden_states, past_key_values = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            **args,
+        )
+        #只对指定位置的 hidden states 计算词表 logits，从而减少不必要的计算
+        slice_indices = (
+            slice(-logits_to_keep, None)
+            if isinstance(logits_to_keep, int)
+            else logits_to_keep
+        )
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
+
+        loss = None
+        if labels is not None:
+            # 输入:   A   B   C   D
+            # 预测:   B   C   D
+            # 错开预测和标签
+            x = logits[..., :-1, :].contiguous()
+            y = labels[..., 1:].contiguous()
+            loss = F.cross_entropy(
+                x.view(-1, x.size(-1)),# (B*(L-1),vocab_size)
+                y.view(-1), # (B*(L-1))
+                ignore_index=-100,
+            )
+
+        output = CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=past_key_values,
+            hidden_states=hidden_states,
+        )
+        # output.aux_loss = aux_loss
+        return output
 
