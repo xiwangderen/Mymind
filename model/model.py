@@ -668,10 +668,12 @@ class MymindForCausalLM(PreTrainedModel, GenerationMixin):
         )
         #只对指定位置的 hidden states 计算词表 logits，从而减少不必要的计算
         slice_indices = (
-            slice(-logits_to_keep, None)
+            #logits_to_keep 是这个 forward 的参数，用来指定：对哪些 token 位置计算词表预测分数（logits）
+            slice(-logits_to_keep, None) # slice(start, stop, step)分别表示起始位置、结束位置（不包含）、步长。省略步长时默认为 1，结束位置为 None 时表示一直取到末尾
             if isinstance(logits_to_keep, int)
             else logits_to_keep
         )
+        # 取指定的 token 位置
         logits = self.lm_head(hidden_states[:, slice_indices, :])
 
         loss = None
@@ -684,7 +686,7 @@ class MymindForCausalLM(PreTrainedModel, GenerationMixin):
             loss = F.cross_entropy(
                 x.view(-1, x.size(-1)),# (B*(L-1),vocab_size)
                 y.view(-1), # (B*(L-1))
-                ignore_index=-100,
+                ignore_index=-100,  # label为100的标签不参与计算！
             )
 
         output = CausalLMOutputWithPast(
